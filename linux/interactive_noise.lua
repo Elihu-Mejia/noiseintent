@@ -1,8 +1,29 @@
--- Add current directory to cpath to find noiseintent.so
-package.cpath = package.cpath .. ";./?.so"
-
-local noise = require("noiseintent")
 local markov = require("noise_markov")
+local noise
+
+-- Robust loading: Handle missing or corrupt C module by falling back to a mock
+local status, lib = pcall(require, "noiseintent")
+if status then
+    noise = lib
+else
+    io.stderr:write("[BOOT ERROR] Unable to load 'noiseintent' core: " .. tostring(lib) .. "\n")
+    io.stderr:write("[SYSTEM] INITIALIZING DUMMY INTERFACE. AUDIO WILL BE MUTED.\n\n")
+    
+    noise = {
+        create_sync = function() return {} end,
+        new = function(amp, seed)
+            return {
+                set_bit_depth = function() end,
+                sequence_string = function() end,
+                play_async = function() end,
+                set_amplitude = function() end,
+                set_tempo = function() end,
+                set_auto_glitch = function() end,
+                stop = function() end,
+            }
+        end
+    }
+end
 
 local M = {}
 
@@ -33,7 +54,7 @@ function M.run()
         table.insert(ctxs, ctx)
         table.insert(states, {seq=seq_str, vol=0.5 / math.sqrt(count), tempo=1.0})
     end
-    
+
     print("--- GUNDAM SOUND SYSTEM ONLINE // UNITS: " .. count .. " ---")
     print("[STATUS] INFINITE CYCLE ENGAGED. AWAITING TACTICAL DATA.")
     if count > 1 then
@@ -42,7 +63,7 @@ function M.run()
     print("[LEGEND] [+] BOOST [/] BRAKE [.] IDLE [0-9] IMPACT [A-Z] THRUST")
     print("[OPCODES] 'quit', 'list', 'vol <val>', 'tempo <val>', 'seq <str>', 'markov <data>', 'evolve', 'funnel <cnt>', 'autoglitch <freq>', 'transam <dur>', 'save <file>', 'load <file>', 'minovsky'")
     print("[ACTIVE PATTERN] " .. seq_str)
-    
+
     -- Start async playback (approx 1000 hours)
     for _, ctx in ipairs(ctxs) do
         if sync then
@@ -51,7 +72,7 @@ function M.run()
             ctx:play_async(44100, 2, 3600000)
         end
     end
-    
+
     while true do
         -- Cleanup funnels
         local now = os.time()
@@ -84,12 +105,12 @@ function M.run()
         local target_idx = nil
         local cmd_str = input
 
-        -- Check for target syntax
-        local prefix, rest = input:match("^(%d+):%s*(.*)")
-        if prefix then
-            target_idx = tonumber(prefix)
-            cmd_str = rest
-        end
+                    -- Check for target syntax
+                    local prefix, rest = input:match("^(%d+):%s*(.*)")
+                    if prefix then
+                        target_idx = tonumber(prefix)
+                        cmd_str = rest
+                    end
 
         local function apply(fn)
             if target_idx then
@@ -170,17 +191,8 @@ function M.run()
                 c:set_amplitude(0.0) 
                 states[i].vol = 0.0 
             end)
-            for i=1, 20 do
-                local l = ""
-                for j=1, 60 do
-                    if math.random() > 0.9 then l = l .. "*"
-                    elseif math.random() > 0.8 then l = l .. "."
-                    else l = l .. " " end
-                end
-                print(l)
-                os.execute("sleep 0.05")
-            end
             print("[SYSTEM] VISUAL CONTACT ONLY. DRIVES MUTED.")
+            for i=1, 5 do print(" ... ... ... ") os.execute("sleep 0.1") end
             break
         elseif cmd_str:match("^funnel") then
             local cnt = tonumber(cmd_str:match("^funnel%s+(.*)")) or 5
@@ -260,6 +272,7 @@ function M.run()
     end
     print("[SYSTEM OFFLINE] MISSION COMPLETE.")
 end
+
 
 -- Auto-run if executed directly
 if arg and arg[0] and string.find(arg[0], "interactive_noise.lua") then

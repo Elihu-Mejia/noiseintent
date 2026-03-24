@@ -3,12 +3,7 @@
 #include <stddef.h>
 #include <stdlib.h>
 #include <math.h>
-#ifdef __linux__
-  #include <alsa/asoundlib.h>
-#elif defined(__APPLE__)
-  #include <AudioToolbox/AudioToolbox.h>
-  #include <unistd.h>
-#endif
+#include <alsa/asoundlib.h>
 #include <lua.h>
 #include <lauxlib.h>
 #include <lualib.h>
@@ -22,55 +17,6 @@
  * Implements a simple, state-preserving white noise generator using 
  * a Linear Congruential Generator (LCG) for randomness.
  */
-
-#ifdef __APPLE__
-/* macOS pthread_barrier_t implementation (missing in macOS pthreads) */
-typedef struct {
-    pthread_mutex_t mutex;
-    pthread_cond_t cond;
-    unsigned int count;
-    unsigned int current;
-    unsigned int generation;
-} pthread_barrier_t;
-
-static int pthread_barrier_init(pthread_barrier_t *barrier, const void *attr, unsigned int count) {
-    if (count == 0) return -1;
-    if (pthread_mutex_init(&barrier->mutex, 0) < 0) return -1;
-    if (pthread_cond_init(&barrier->cond, 0) < 0) {
-        pthread_mutex_destroy(&barrier->mutex);
-        return -1;
-    }
-    barrier->count = count;
-    barrier->current = 0;
-    barrier->generation = 0;
-    return 0;
-}
-
-static int pthread_barrier_destroy(pthread_barrier_t *barrier) {
-    pthread_cond_destroy(&barrier->cond);
-    pthread_mutex_destroy(&barrier->mutex);
-    return 0;
-}
-
-static int pthread_barrier_wait(pthread_barrier_t *barrier) {
-    pthread_mutex_lock(&barrier->mutex);
-    unsigned int gen = barrier->generation;
-    barrier->current++;
-    if (barrier->current >= barrier->count) {
-        barrier->generation++;
-        barrier->current = 0;
-        pthread_cond_broadcast(&barrier->cond);
-        pthread_mutex_unlock(&barrier->mutex);
-        return 1; 
-    } else {
-        while (gen == barrier->generation) {
-            pthread_cond_wait(&barrier->cond, &barrier->mutex);
-        }
-        pthread_mutex_unlock(&barrier->mutex);
-        return 0;
-    }
-}
-#endif
 
 typedef struct {
     float duration; // Duration in seconds
@@ -612,79 +558,6 @@ void noise_process_buffer(NoiseContext* ctx, float* buffer, size_t num_samples) 
     pthread_mutex_unlock(&ctx->lock);
 }
 
-#ifdef __APPLE__
-/* macOS AudioQueue Callback State */
-typedef struct {
-    NoiseContext* ctx;
-    unsigned long frames_played;
-    unsigned long total_frames;
-    unsigned long max_frames;
-    float fade_in_sec;
-    float fade_out_sec;
-    unsigned int sample_rate;
-    unsigned int channels;
-    int done;
-} AQCallbackState;
-
-/* macOS AudioQueue Callback */
-static void HandleAQOutput(void *aqData, AudioQueueRef inAQ, AudioQueueBufferRef inBuffer) {
-    AQCallbackState* state = (AQCallbackState*)aqData;
-    if (state->done) return;
-
-    NoiseContext* ctx = state->ctx;
-    unsigned int channels = state->channels;
-    
-    pthread_mutex_lock(&ctx->lock);
-    int stop = ctx->stop_flag;
-    pthread_mutex_unlock(&ctx->lock);
-    
-    if (stop || state->frames_played >= state->total_frames) {
-        state->done = 1;
-        // Fill silence to be safe
-        memset(inBuffer->mAudioData, 0, inBuffer->mAudioDataBytesCapacity);
-        inBuffer->mAudioDataByteSize = inBuffer->mAudioDataBytesCapacity;
-        AudioQueueEnqueueBuffer(inAQ, inBuffer, 0, NULL);
-        return;
-    }
-
-    unsigned int frame_size = sizeof(int16_t) * channels;
-    unsigned int frames_cap = inBuffer->mAudioDataBytesCapacity / frame_size;
-    unsigned long frames_remaining = state->total_frames - state->frames_played;
-    unsigned int frames = (frames_remaining < frames_cap) ? (unsigned int)frames_remaining : frames_cap;
-    
-    size_t samples_to_process = frames * channels;
-    float* float_buffer = (float*)malloc(samples_to_process * sizeof(float));
-    if (!float_buffer) return;
-    
-    noise_process_buffer(ctx, float_buffer, samples_to_process);
-
-    for (unsigned int i = 0; i < frames; i++) {
-        unsigned long current_frame = state->frames_played + i;
-        float envelope = 1.0f;
-        if (state->fade_in_sec > 0.0f) {
-            float in_frames = state->fade_in_sec * (float)state->sample_rate;
-            if (current_frame < in_frames) envelope *= (float)current_frame / in_frames;
-        }
-        if (state->fade_out_sec > 0.0f) {
-            float out_frames = state->fade_out_sec * (float)state->sample_rate;
-            if (current_frame >= state->max_frames - out_frames) envelope *= (float)(state->max_frames - current_frame) / out_frames;
-        }
-        for (unsigned int ch = 0; ch < channels; ch++) float_buffer[i * channels + ch] *= envelope;
-    }
-
-    int16_t* out_ptr = (int16_t*)inBuffer->mAudioData;
-    for (size_t i = 0; i < samples_to_process; i++) {
-        float s = float_buffer[i];
-        if (s > 1.0f) s = 1.0f; else if (s < -1.0f) s = -1.0f;
-        out_ptr[i] = (int16_t)(s * 32767.0f);
-    }
-    free(float_buffer);
-    inBuffer->mAudioDataByteSize = frames * frame_size;
-    state->frames_played += frames;
-    AudioQueueEnqueueBuffer(inAQ, inBuffer, 0, NULL);
-}
-#endif
-
 /**
  * Plays the noise through the default ALSA audio device (speakers).
  * Note: Requires linking with -lasound.
@@ -706,7 +579,6 @@ int noise_play_speaker(NoiseContext* ctx, unsigned int sample_rate, unsigned int
     ctx->channel_index = 0;
     pthread_mutex_unlock(&ctx->lock);
 
-#ifdef __linux__
     snd_pcm_t *pcm_handle;
     int err;
     
@@ -789,53 +661,6 @@ int noise_play_speaker(NoiseContext* ctx, unsigned int sample_rate, unsigned int
 
     snd_pcm_drain(pcm_handle);
     snd_pcm_close(pcm_handle);
-#elif defined(__APPLE__)
-    pthread_mutex_lock(&ctx->lock);
-    float fade_in = ctx->fade_in_sec;
-    float fade_out = ctx->fade_out_sec;
-    pthread_mutex_unlock(&ctx->lock);
-
-    AudioStreamBasicDescription format = {0};
-    format.mSampleRate = (Float64)sample_rate;
-    format.mFormatID = kAudioFormatLinearPCM;
-    format.mFormatFlags = kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked;
-    format.mFramesPerPacket = 1;
-    format.mChannelsPerFrame = channels;
-    format.mBitsPerChannel = 16;
-    format.mBytesPerPacket = 2 * channels;
-    format.mBytesPerFrame = 2 * channels;
-
-    AQCallbackState state;
-    state.ctx = ctx;
-    state.frames_played = 0;
-    state.total_frames = (unsigned long)sample_rate * duration_sec;
-    state.max_frames = state.total_frames;
-    state.fade_in_sec = fade_in;
-    state.fade_out_sec = fade_out;
-    state.sample_rate = sample_rate;
-    state.channels = channels;
-    state.done = 0;
-
-    AudioQueueRef queue;
-    if (AudioQueueNewOutput(&format, HandleAQOutput, &state, NULL, NULL, 0, &queue) != noErr) return -1;
-
-    AudioQueueBufferRef buffers[3];
-    int buffer_size = 4096 * format.mBytesPerFrame;
-    for (int i=0; i<3; i++) {
-        AudioQueueAllocateBuffer(queue, buffer_size, &buffers[i]);
-        HandleAQOutput(&state, queue, buffers[i]);
-    }
-
-    AudioQueueStart(queue, NULL);
-    while (!state.done) {
-        pthread_mutex_lock(&ctx->lock);
-        if (ctx->stop_flag) state.done = 1;
-        pthread_mutex_unlock(&ctx->lock);
-        usleep(100000); // 100ms polling
-    }
-    AudioQueueStop(queue, true);
-    AudioQueueDispose(queue, true);
-#endif
     return 0;
 }
 
@@ -1143,11 +968,7 @@ static int l_noise_play(lua_State *L) {
     int err = noise_play_speaker(ctx, rate, channels, duration);
     if (err < 0) {
         lua_pushboolean(L, 0);
-#ifdef __linux__
         lua_pushstring(L, snd_strerror(err));
-#else
-        lua_pushstring(L, "Playback failed");
-#endif
         return 2;
     }
     lua_pushboolean(L, 1);
