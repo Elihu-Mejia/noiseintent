@@ -1,8 +1,25 @@
-local markov = require("./macos/noise_markov")
+-- Ensure modules can be found relative to current directory or macos subdirectory
+-- Detect OS and configure paths
+local handle = io.popen("uname -s")
+local os_name = handle and handle:read("*l") or "Unknown"
+if handle then handle:close() end
+
+package.cpath = package.cpath .. ";./?.so"
+package.path = package.path .. ";./?.lua"
+
+if os_name == "Darwin" then
+    package.cpath = package.cpath .. ";./macos/?.so"
+    package.path = package.path .. ";./macos/?.lua"
+elseif os_name == "Linux" then
+    package.cpath = package.cpath .. ";./linux/?.so"
+    package.path = package.path .. ";./linux/?.lua"
+end
+
+local markov = require("noise_markov")
 local noise
 
 -- Robust loading: Handle missing or corrupt C module by falling back to a mock
-local status, lib = pcall(require, "./macos/noiseintent")
+local status, lib = pcall(require, "noiseintent")
 if status then
     noise = lib
 else

@@ -1,0 +1,4 @@
+return {
+  {vol=0.288675, tempo=0.400000, seq="trans am", corpus=""},
+  {vol=0.288675, tempo=1.000000, seq="trans am", corpus=""},
+}
