@@ -43,6 +43,20 @@ else
     }
 end
 
+-- Terminal state management
+local function set_raw_mode(enable)
+    if enable then
+        os.execute("stty -icanon -echo min 0")
+    else
+        os.execute("stty sane")
+    end
+end
+
+local function clear_screen()
+    -- ANSI: Clear screen and home cursor
+    io.write("\027[H\027[2J")
+end
+
 local M = {}
 
 function M.run()
@@ -64,6 +78,22 @@ function M.run()
     local base_dur = 0.15
     local states = {}
 
+    -- Visualizer helper: maps sequence characters to ASCII blocks for tactical display
+    local function get_viz(seq, width)
+        if not seq or #seq == 0 then return string.rep(" ", width) end
+        local out = ""
+        for j = 1, width do
+            local c = seq:sub(((j-1) % #seq) + 1, ((j-1) % #seq) + 1)
+            if c:match("%d") then out = out .. "█"      -- Heavy Impact (Digits)
+            elseif c:match("%u") then out = out .. "▓" -- High Power Thrust (A-Z)
+            elseif c:match("%l") then out = out .. "▒" -- Low Power Thrust (a-z)
+            elseif c == "!" then out = out .. "⚡"      -- Stutter / Discharge
+            elseif c == "." or c == "_" or c == "-" or c == " " then out = out .. " "
+            else out = out .. "░" end                  -- Other modulation
+        end
+        return out
+    end
+
     for i = 1, count do
         -- Create context with random seed
         local ctx = noise.new(0.5 / math.sqrt(count), os.time() + i * 999)
@@ -78,8 +108,12 @@ function M.run()
         print("[INFO] TARGET LOCK: USE 'N:' TO ISOLATE DRIVE (E.G. '1: vol 0.9'). DEFAULT: GLOBAL.")
     end
     print("[LEGEND] [+] BOOST [/] BRAKE [.] IDLE [0-9] IMPACT [A-Z] THRUST")
-    print("[OPCODES] 'quit', 'list', 'vol <val>', 'tempo <val>', 'seq <str>', 'markov <data>', 'evolve', 'funnel <cnt>', 'autoglitch <freq>', 'robot <freq> <depth>', 'delay <time> <fb> <mix>', 'transam <dur>', 'save <file>', 'load <file>', 'minovsky'")
+    print("[OPCODES] 'quit', 'list', 'viz', 'monitor <n>', 'vol <val>', 'tempo <val>', 'seq <str>', 'markov <data>', 'evolve', 'funnel <cnt>', 'autoglitch <freq>', 'robot <freq> <depth>', 'delay <time> <fb> <mix>', 'transam <dur>', 'save <file>', 'load <file>', 'minovsky'")
     print("[ACTIVE PATTERN] " .. seq_str)
+
+    local monitoring = false
+    local cmd_buffer = ""
+    local frame_count = 0
 
     -- Start async playback (approx 1000 hours)
     for _, ctx in ipairs(ctxs) do
@@ -89,6 +123,8 @@ function M.run()
             ctx:play_async(44100, 2, 3600000)
         end
     end
+
+    set_raw_mode(true)
 
     while true do
         -- Cleanup funnels
@@ -108,16 +144,43 @@ function M.run()
             end
         end
 
-        io.write("> ")
+        -- 1. Handle Non-blocking Input
+        local char = io.read(1)
+        local input_ready = false
+        if char then
+            local b = string.byte(char)
+            if b == 10 or b == 13 then -- Enter
+                input_ready = true
+            elseif b == 127 or b == 8 then -- Backspace
+                cmd_buffer = cmd_buffer:sub(1, -2)
+            elseif b >= 32 and b <= 126 then
+                cmd_buffer = cmd_buffer .. char
+            end
+        end
+
+        -- 2. Render Loop (Only if monitoring is active)
+        if monitoring then
+            frame_count = frame_count + 1
+            clear_screen()
+            print("=== GN DRIVE TACTICAL MONITOR [LIVE FEED] ===")
+            for i, s in ipairs(states) do
+                local offset = math.floor(frame_count * s.tempo) % #s.seq
+                local shifted_seq = s.seq:sub(offset + 1) .. s.seq:sub(1, offset)
+                print(string.format("DRIVE %02d [%s] LVL:%.2f", i, get_viz(shifted_seq, 60), s.vol))
+            end
+            print("\n[COMMAND]: " .. cmd_buffer .. "_")
+        elseif input_ready or (char and #char > 0) then
+            -- Simple feedback if not monitoring
+            io.write("\r> " .. cmd_buffer .. "  \b")
+        end
         io.flush()
-        local input = io.read()
-        if not input then break end -- EOF
         
-        input = input:match("^%s*(.-)%s*$") -- Trim
-        
+        -- 3. Process Command
+        local input = input_ready and cmd_buffer or ""
         if input == "quit" or input == "exit" then
             break
         end
+        if input_ready then cmd_buffer = "" end -- Clear buffer after processing
 
         local target_idx = nil
         local cmd_str = input
@@ -315,15 +378,44 @@ function M.run()
                 end
             end
         elseif cmd_str == "list" then
+            set_raw_mode(false) -- Restore for clean list printing
+            print("")
             for i, s in ipairs(states) do
-                print(string.format("[DRIVE %d] LVL: %.2f | CLK: %.2f | ROBOT: %.1fHz | DLY: %.2fs | SEQ: %s", i, s.vol, s.tempo, s.robot_freq or 0, s.delay_t or 0, s.seq))
+                local viz = get_viz(s.seq, 30)
+                print(string.format("[DRIVE %d] LVL: %.2f | CLK: %.2f | [%s] | RAW: %s", i, s.vol, s.tempo, viz, s.seq))
             end
-        elseif #cmd_str > 0 then
+        elseif cmd_str == "viz" then
+            print("\n" .. string.rep("=", 60))
+            print("  GN-DRIVE TACTICAL STATUS REPORT")
+            print(string.rep("=", 60))
+            for i, s in ipairs(states) do
+                local viz = get_viz(s.seq, 50)
+                local power = math.floor(s.vol * 100)
+                local bar = string.rep("■", math.floor(power/5)) .. string.rep(" ", 20 - math.floor(power/5))
+                print(string.format(" UNIT %02d | POWER [%s] %03d%% | CLK: %.2f", i, bar, power, s.tempo))
+                print(string.format(" SEQuence | %s", viz))
+                local mods = ""
+                if (s.robot_freq or 0) > 0 then mods = mods .. string.format("ROBOT:%.1fHz ", s.robot_freq) end
+                if (s.delay_t or 0) > 0 then mods = mods .. string.format("DELAY:%.2fs ", s.delay_t) end
+                if s.trans_am_expire then mods = mods .. "TRANS-AM " end
+                if #mods > 0 then print(string.format(" MODuLATE | %s", mods)) end
+                print(string.rep("-", 60))
+            end
+            print("")
+            set_raw_mode(true)
+        elseif cmd_str == "monitor" then
+            monitoring = not monitoring
+            if not monitoring then clear_screen() end
+            print("[SYSTEM] MONITOR MODE: " .. (monitoring and "ENGAGED" or "DISENGAGED"))
+        elseif input_ready and #cmd_str > 0 then
             -- Update sequence
             apply(function(c, i) c:sequence_string(cmd_str, base_dur, true); states[i].seq = cmd_str; print("[DRIVE "..i.."] SEQUENCE RECONFIGURED.") end)
         end
+
+        os.execute("sleep 0.05") -- Control refresh rate/CPU usage
     end
     
+    set_raw_mode(false)
     for _, ctx in ipairs(ctxs) do
         ctx:stop()
     end
