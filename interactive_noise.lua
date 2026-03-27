@@ -82,14 +82,18 @@ function M.run()
     local function get_viz(seq, width)
         if not seq or #seq == 0 then return string.rep(" ", width) end
         local out = ""
+        -- Use Unicode block elements to simulate an oscilloscope trace (sparkline)
+        local levels = {" ", "▂", "▃", "▄", "▅", "▆", "▇", "█"}
         for j = 1, width do
             local c = seq:sub(((j-1) % #seq) + 1, ((j-1) % #seq) + 1)
-            if c:match("%d") then out = out .. "█"      -- Heavy Impact (Digits)
-            elseif c:match("%u") then out = out .. "▓" -- High Power Thrust (A-Z)
-            elseif c:match("%l") then out = out .. "▒" -- Low Power Thrust (a-z)
-            elseif c == "!" then out = out .. "⚡"      -- Stutter / Discharge
-            elseif c == "." or c == "_" or c == "-" or c == " " then out = out .. " "
-            else out = out .. "░" end                  -- Other modulation
+            local lv = 1
+            if c:match("%d") then lv = 8      -- Peak impact
+            elseif c:match("%u") then lv = 6  -- High thrust
+            elseif c:match("%l") then lv = 4  -- Mid modulation
+            elseif c == "!" then lv = 8       -- Stutter spike
+            elseif c:match("[._%- ]") then lv = 1 -- Zero/Baseline
+            else lv = 2 end                   -- Low modulation
+            out = out .. levels[lv]
         end
         return out
     end
@@ -99,7 +103,7 @@ function M.run()
         local ctx = noise.new(0.5 / math.sqrt(count), os.time() + i * 999)
         ctx:sequence_string(seq_str, base_dur, true)
         table.insert(ctxs, ctx)
-        table.insert(states, {seq=seq_str, vol=0.5 / math.sqrt(count), tempo=1.0, robot_freq=0.0, robot_depth=0.0, delay_t=0.0, delay_f=0.0, delay_m=0.0})
+        table.insert(states, {seq=seq_str, vol=0.5 / math.sqrt(count), tempo=1.0, phase=0, robot_freq=0.0, robot_depth=0.0, delay_t=0.0, delay_f=0.0, delay_m=0.0})
     end
 
     print("--- GUNDAM SOUND SYSTEM ONLINE // UNITS: " .. count .. " ---")
@@ -108,7 +112,7 @@ function M.run()
         print("[INFO] TARGET LOCK: USE 'N:' TO ISOLATE DRIVE (E.G. '1: vol 0.9'). DEFAULT: GLOBAL.")
     end
     print("[LEGEND] [+] BOOST [/] BRAKE [.] IDLE [0-9] IMPACT [A-Z] THRUST")
-    print("[OPCODES] 'quit', 'list', 'viz', 'monitor <n>', 'vol <val>', 'tempo <val>', 'seq <str>', 'markov <data>', 'evolve', 'funnel <cnt>', 'autoglitch <freq>', 'robot <freq> <depth>', 'delay <time> <fb> <mix>', 'transam <dur>', 'save <file>', 'load <file>', 'minovsky'")
+    print("[OPCODES] 'quit', 'list', 'viz', 'monitor <n>', 'vol <val>', 'tempo <val>', 'phase <val>', 'seq <str>', 'markov <data>', 'evolve', 'funnel <cnt>', 'autoglitch <freq>', 'robot <freq> <depth>', 'delay <time> <fb> <mix>', 'transam <dur>', 'save <file>', 'load <file>', 'minovsky'")
     print("[ACTIVE PATTERN] " .. seq_str)
 
     local monitoring = false
@@ -164,7 +168,7 @@ function M.run()
             clear_screen()
             print("=== GN DRIVE TACTICAL MONITOR [LIVE FEED] ===")
             for i, s in ipairs(states) do
-                local offset = math.floor(frame_count * s.tempo) % #s.seq
+                local offset = (math.floor(frame_count * s.tempo) + (s.phase or 0)) % #s.seq
                 local shifted_seq = s.seq:sub(offset + 1) .. s.seq:sub(1, offset)
                 print(string.format("DRIVE %02d [%s] LVL:%.2f", i, get_viz(shifted_seq, 60), s.vol))
             end
@@ -221,10 +225,28 @@ function M.run()
                     end
                 end)
             end
+        elseif cmd_str:match("^phase") then
+            local p = tonumber(cmd_str:match("^phase%s+(.*)"))
+            if p then
+                apply(function(c, i)
+                    states[i].phase = math.floor(p)
+                    local s = states[i].seq
+                    local off = states[i].phase % #s
+                    local ps = s:sub(off+1) .. s:sub(1, off)
+                    c:sequence_string(ps, base_dur, true)
+                    print(string.format("[DRIVE %d] PHASE SHIFTED TO %d", i, states[i].phase))
+                end)
+            end
         elseif cmd_str:match("^seq") then
             local s = cmd_str:match("^seq%s+(.*)")
             if s then
-                apply(function(c, i) c:sequence_string(s, base_dur, true); states[i].seq = s; print("[DRIVE "..i.."] SEQUENCE RECONFIGURED.") end)
+                apply(function(c, i) 
+                    states[i].seq = s
+                    local off = (states[i].phase or 0) % #s
+                    local ps = s:sub(off+1) .. s:sub(1, off)
+                    c:sequence_string(ps, base_dur, true)
+                    print("[DRIVE "..i.."] SEQUENCE RECONFIGURED.") 
+                end)
             end
         elseif cmd_str:match("^markov") then
             local corpus = cmd_str:match("^markov%s+(.*)")
@@ -234,8 +256,10 @@ function M.run()
                     states[i].markov = m
                     states[i].corpus = corpus
                     local s = m:generate(32)
-                    c:sequence_string(s, base_dur, true)
                     states[i].seq = s
+                    local off = (states[i].phase or 0) % #s
+                    local ps = s:sub(off+1) .. s:sub(1, off)
+                    c:sequence_string(ps, base_dur, true)
                     print("[DRIVE "..i.."] NEURAL LINK ESTABLISHED: " .. s)
                 end)
             end
@@ -247,8 +271,10 @@ function M.run()
     -- (X) --  [NEWTYPE FLASH]
       /   \]])
                     local s = states[i].markov:generate(32)
-                    c:sequence_string(s, base_dur, true)
                     states[i].seq = s
+                    local off = (states[i].phase or 0) % #s
+                    local ps = s:sub(off+1) .. s:sub(1, off)
+                    c:sequence_string(ps, base_dur, true)
                     print("[DRIVE "..i.."] PATTERN MUTATION: " .. s)
                 end
             end)
@@ -330,8 +356,8 @@ function M.run()
                 if f then
                     f:write("return {\n")
                     for _, s in ipairs(states) do
-                        f:write(string.format("  {vol=%f, tempo=%f, seq=%q, corpus=%q, robot_f=%f, robot_d=%f, delay_t=%f, delay_f=%f, delay_m=%f},\n", 
-                            s.vol, s.tempo, s.seq, s.corpus or "", s.robot_freq or 0, s.robot_depth or 0, s.delay_t or 0, s.delay_f or 0, s.delay_m or 0))
+                        f:write(string.format("  {vol=%f, tempo=%f, phase=%d, seq=%q, corpus=%q, robot_f=%f, robot_d=%f, delay_t=%f, delay_f=%f, delay_m=%f},\n", 
+                            s.vol, s.tempo, s.phase or 0, s.seq, s.corpus or "", s.robot_freq or 0, s.robot_depth or 0, s.delay_t or 0, s.delay_f or 0, s.delay_m or 0))
                     end
                     f:write("}\n")
                     f:close()
@@ -351,7 +377,13 @@ function M.run()
                             if ctxs[i] then
                                 if s.vol then ctxs[i]:set_amplitude(s.vol); states[i].vol = s.vol end
                                 if s.tempo then ctxs[i]:set_tempo(s.tempo); states[i].tempo = s.tempo end
-                                if s.seq then ctxs[i]:sequence_string(s.seq, base_dur, true); states[i].seq = s.seq end
+                                if s.phase then states[i].phase = s.phase end
+                                if s.seq then 
+                                    states[i].seq = s.seq
+                                    local off = (states[i].phase or 0) % #s.seq
+                                    local ps = s.seq:sub(off+1) .. s.seq:sub(1, off)
+                                    ctxs[i]:sequence_string(ps, base_dur, true)
+                                end
                                 if s.robot_f then 
                                     ctxs[i]:set_robot(s.robot_f, s.robot_d or 1.0)
                                     states[i].robot_freq = s.robot_f
@@ -382,7 +414,7 @@ function M.run()
             print("")
             for i, s in ipairs(states) do
                 local viz = get_viz(s.seq, 30)
-                print(string.format("[DRIVE %d] LVL: %.2f | CLK: %.2f | [%s] | RAW: %s", i, s.vol, s.tempo, viz, s.seq))
+                print(string.format("[DRIVE %d] LVL: %.2f | CLK: %.2f | PHS: %d | [%s] | RAW: %s", i, s.vol, s.tempo, s.phase or 0, viz, s.seq))
             end
         elseif cmd_str == "viz" then
             print("\n" .. string.rep("=", 60))
@@ -392,7 +424,7 @@ function M.run()
                 local viz = get_viz(s.seq, 50)
                 local power = math.floor(s.vol * 100)
                 local bar = string.rep("■", math.floor(power/5)) .. string.rep(" ", 20 - math.floor(power/5))
-                print(string.format(" UNIT %02d | POWER [%s] %03d%% | CLK: %.2f", i, bar, power, s.tempo))
+                print(string.format(" UNIT %02d | POWER [%s] %03d%% | CLK: %.2f | PHS: %d", i, bar, power, s.tempo, s.phase or 0))
                 print(string.format(" SEQuence | %s", viz))
                 local mods = ""
                 if (s.robot_freq or 0) > 0 then mods = mods .. string.format("ROBOT:%.1fHz ", s.robot_freq) end
@@ -409,7 +441,13 @@ function M.run()
             print("[SYSTEM] MONITOR MODE: " .. (monitoring and "ENGAGED" or "DISENGAGED"))
         elseif input_ready and #cmd_str > 0 then
             -- Update sequence
-            apply(function(c, i) c:sequence_string(cmd_str, base_dur, true); states[i].seq = cmd_str; print("[DRIVE "..i.."] SEQUENCE RECONFIGURED.") end)
+            apply(function(c, i) 
+                states[i].seq = cmd_str
+                local off = (states[i].phase or 0) % #cmd_str
+                local ps = cmd_str:sub(off+1) .. cmd_str:sub(1, off)
+                c:sequence_string(ps, base_dur, true)
+                print("[DRIVE "..i.."] SEQUENCE RECONFIGURED.") 
+            end)
         end
 
         os.execute("sleep 0.05") -- Control refresh rate/CPU usage
