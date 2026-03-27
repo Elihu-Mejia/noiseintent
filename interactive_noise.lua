@@ -35,6 +35,8 @@ else
                 set_amplitude = function() end,
                 set_tempo = function() end,
                 set_auto_glitch = function() end,
+                set_robot = function() end,
+                set_delay = function() end,
                 stop = function() end,
             }
         end
@@ -67,7 +69,7 @@ function M.run()
         local ctx = noise.new(0.5 / math.sqrt(count), os.time() + i * 999)
         ctx:sequence_string(seq_str, base_dur, true)
         table.insert(ctxs, ctx)
-        table.insert(states, {seq=seq_str, vol=0.5 / math.sqrt(count), tempo=1.0})
+        table.insert(states, {seq=seq_str, vol=0.5 / math.sqrt(count), tempo=1.0, robot_freq=0.0, robot_depth=0.0, delay_t=0.0, delay_f=0.0, delay_m=0.0})
     end
 
     print("--- GUNDAM SOUND SYSTEM ONLINE // UNITS: " .. count .. " ---")
@@ -76,7 +78,7 @@ function M.run()
         print("[INFO] TARGET LOCK: USE 'N:' TO ISOLATE DRIVE (E.G. '1: vol 0.9'). DEFAULT: GLOBAL.")
     end
     print("[LEGEND] [+] BOOST [/] BRAKE [.] IDLE [0-9] IMPACT [A-Z] THRUST")
-    print("[OPCODES] 'quit', 'list', 'vol <val>', 'tempo <val>', 'seq <str>', 'markov <data>', 'evolve', 'funnel <cnt>', 'autoglitch <freq>', 'transam <dur>', 'save <file>', 'load <file>', 'minovsky'")
+    print("[OPCODES] 'quit', 'list', 'vol <val>', 'tempo <val>', 'seq <str>', 'markov <data>', 'evolve', 'funnel <cnt>', 'autoglitch <freq>', 'robot <freq> <depth>', 'delay <time> <fb> <mix>', 'transam <dur>', 'save <file>', 'load <file>', 'minovsky'")
     print("[ACTIVE PATTERN] " .. seq_str)
 
     -- Start async playback (approx 1000 hours)
@@ -192,6 +194,36 @@ function M.run()
             if f then
                 apply(function(c, i) c:set_auto_glitch(f); print("[DRIVE "..i.."] AUTO-INTERFERENCE RATE: " .. f .. " Hz") end)
             end
+        elseif cmd_str:match("^robot") then
+            local args = cmd_str:match("^robot%s+(.*)")
+            if args then
+                local f_str, d_str = args:match("([%d%.]+)%s*([%d%.]*)")
+                local f = tonumber(f_str)
+                local d = tonumber(d_str) or 1.0
+                if f then
+                    apply(function(c, i) 
+                        c:set_robot(f, d)
+                        states[i].robot_freq = f
+                        states[i].robot_depth = d
+                        print(string.format("[DRIVE %d] ROBOTIC MODULATION: %.1f Hz (Depth: %.2f)", i, f, d))
+                    end)
+                end
+            end
+        elseif cmd_str:match("^delay") then
+            local args = cmd_str:match("^delay%s+(.*)")
+            if args then
+                local t_str, f_str, m_str = args:match("([%d%.]+)%s*([%d%.]*)%s*([%d%.]*)")
+                local t = tonumber(t_str)
+                local f = tonumber(f_str) or 0.4
+                local m = tonumber(m_str) or 0.5
+                if t then
+                    apply(function(c, i) 
+                        c:set_delay(t, f, m)
+                        states[i].delay_t = t; states[i].delay_f = f; states[i].delay_m = m
+                        print(string.format("[DRIVE %d] ECHO SYSTEM: %.2fs Time | %.2f FB | %.2f Mix", i, t, f, m))
+                    end)
+                end
+            end
         elseif cmd_str:match("^transam") then
             local dur = tonumber(cmd_str:match("^transam%s+(.*)")) or 10
             print("[SYSTEM ALERT] TRANS-AM SYSTEM ACTIVATED. MAX OUTPUT FOR " .. dur .. " SECONDS.")
@@ -235,8 +267,8 @@ function M.run()
                 if f then
                     f:write("return {\n")
                     for _, s in ipairs(states) do
-                        f:write(string.format("  {vol=%f, tempo=%f, seq=%q, corpus=%q},\n", 
-                            s.vol, s.tempo, s.seq, s.corpus or ""))
+                        f:write(string.format("  {vol=%f, tempo=%f, seq=%q, corpus=%q, robot_f=%f, robot_d=%f, delay_t=%f, delay_f=%f, delay_m=%f},\n", 
+                            s.vol, s.tempo, s.seq, s.corpus or "", s.robot_freq or 0, s.robot_depth or 0, s.delay_t or 0, s.delay_f or 0, s.delay_m or 0))
                     end
                     f:write("}\n")
                     f:close()
@@ -257,6 +289,17 @@ function M.run()
                                 if s.vol then ctxs[i]:set_amplitude(s.vol); states[i].vol = s.vol end
                                 if s.tempo then ctxs[i]:set_tempo(s.tempo); states[i].tempo = s.tempo end
                                 if s.seq then ctxs[i]:sequence_string(s.seq, base_dur, true); states[i].seq = s.seq end
+                                if s.robot_f then 
+                                    ctxs[i]:set_robot(s.robot_f, s.robot_d or 1.0)
+                                    states[i].robot_freq = s.robot_f
+                                    states[i].robot_depth = s.robot_d or 1.0
+                                end
+                                if s.delay_t then
+                                    ctxs[i]:set_delay(s.delay_t, s.delay_f or 0.4, s.delay_m or 0.5)
+                                    states[i].delay_t = s.delay_t
+                                    states[i].delay_f = s.delay_f or 0.4
+                                    states[i].delay_m = s.delay_m or 0.5
+                                end
                                 if s.corpus and #s.corpus > 0 then
                                     states[i].corpus = s.corpus
                                     states[i].markov = markov.new(s.corpus, 2)
@@ -273,7 +316,7 @@ function M.run()
             end
         elseif cmd_str == "list" then
             for i, s in ipairs(states) do
-                print(string.format("[DRIVE %d] LVL: %.2f | CLK: %.2f | SEQ: %s", i, s.vol, s.tempo, s.seq))
+                print(string.format("[DRIVE %d] LVL: %.2f | CLK: %.2f | ROBOT: %.1fHz | DLY: %.2fs | SEQ: %s", i, s.vol, s.tempo, s.robot_freq or 0, s.delay_t or 0, s.seq))
             end
         elseif #cmd_str > 0 then
             -- Update sequence

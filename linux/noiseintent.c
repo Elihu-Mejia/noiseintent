@@ -73,6 +73,16 @@ typedef struct {
     float super_stutter_last_sample;
     float super_stutter_decim_accum;
     float auto_glitch_freq; // Auto-glitch frequency (events per second)
+    float robot_freq; // Robotic modulation frequency (Hz)
+    float robot_depth; // Robotic modulation depth (0.0-1.0)
+    unsigned long robot_samples_done; // Global sample counter for modulation
+    // Delay effect
+    float* delay_buffer;
+    size_t delay_buffer_len;
+    size_t delay_write_idx;
+    float delay_time_sec;
+    float delay_feedback;
+    float delay_mix;
 } NoiseContext;
 
 typedef struct {
@@ -132,6 +142,15 @@ void noise_init(NoiseContext* ctx, float amplitude, uint32_t seed) {
     ctx->stutter_cnt = 0;
     ctx->super_stutter_active = 0;
     ctx->auto_glitch_freq = 0.0f;
+    ctx->robot_freq = 0.0f;
+    ctx->robot_depth = 0.0f;
+    ctx->robot_samples_done = 0;
+    ctx->delay_time_sec = 0.0f;
+    ctx->delay_feedback = 0.0f;
+    ctx->delay_mix = 0.0f;
+    ctx->delay_buffer_len = 44100 * 2 * 2; // 2 seconds at 44.1kHz stereo
+    ctx->delay_buffer = (float*)calloc(ctx->delay_buffer_len, sizeof(float));
+    ctx->delay_write_idx = 0;
 }
 
 /**
@@ -285,12 +304,63 @@ void noise_set_auto_glitch(NoiseContext* ctx, float freq) {
 }
 
 /**
+ * Set global robotic modulation (envelope pulse).
+ * 
+ * @param ctx Pointer to the NoiseContext structure.
+ * @param freq Modulation frequency in Hz (e.g., 40.0Hz). 0.0 to disable.
+ * @param depth Modulation depth (0.0 to 1.0). 1.0 is full silence on off-cycle.
+ */
+void noise_set_robot(NoiseContext* ctx, float freq, float depth) {
+    if (!ctx) return;
+    pthread_mutex_lock(&ctx->lock);
+    ctx->robot_freq = (freq < 0.0f) ? 0.0f : freq;
+    ctx->robot_depth = (depth < 0.0f) ? 0.0f : (depth > 1.0f ? 1.0f : depth);
+    pthread_mutex_unlock(&ctx->lock);
+}
+
+/**
+ * Set global delay effect parameters.
+ * 
+ * @param ctx Pointer to context.
+ * @param time_sec Delay time in seconds (max 2.0).
+ * @param feedback Feedback amount (0.0 to 0.95 recommended).
+ * @param mix Dry/Wet mix (0.0 to 1.0).
+ */
+void noise_set_delay(NoiseContext* ctx, float time_sec, float feedback, float mix) {
+    if (!ctx) return;
+    pthread_mutex_lock(&ctx->lock);
+    ctx->delay_time_sec = (time_sec < 0.0f) ? 0.0f : (time_sec > 2.0f ? 2.0f : time_sec);
+    ctx->delay_feedback = (feedback < 0.0f) ? 0.0f : (feedback > 0.99f ? 0.99f : feedback);
+    ctx->delay_mix = (mix < 0.0f) ? 0.0f : (mix > 1.0f ? 1.0f : mix);
+    pthread_mutex_unlock(&ctx->lock);
+}
+
+/**
  * Internal unsafe tick function (must hold lock).
  * 
  * @param ctx Pointer to the NoiseContext structure.
  * @return A float sample in the range [-amplitude, amplitude].
  */
 static float _noise_tick_unsafe(NoiseContext* ctx) {
+    // Handle Global Robot Modulation
+    float robot_mod = 1.0f;
+    float current_alpha = ctx->alpha;
+    if (ctx->robot_freq > 0.0f) {
+        // Increment counter once per frame (on the first channel)
+        if (ctx->channel_index == 0) {
+            ctx->robot_samples_done++;
+        }
+        
+        float period = (float)ctx->sample_rate / ctx->robot_freq;
+        if (period > 0.0f) {
+            // Square wave envelope
+            if (fmodf((float)ctx->robot_samples_done, period) < period * 0.5f) {
+                robot_mod = 1.0f - ctx->robot_depth;
+                current_alpha = ctx->alpha * (1.0f - ctx->robot_depth);
+            }
+        }
+    }
+
     // Handle Sequencer
 
     // Auto Glitch Logic (Probabilistic trigger)
@@ -328,6 +398,7 @@ static float _noise_tick_unsafe(NoiseContext* ctx) {
         }
     }
 
+    float out_sample = 0.0f;
     if (ctx->seq_active && ctx->seq_count > 0) {
         SeqStep* step = &ctx->seq_steps[ctx->seq_index];
         
@@ -448,7 +519,7 @@ static float _noise_tick_unsafe(NoiseContext* ctx) {
             uint32_t r = _noise_lcg_rand(&ctx->state);
             float n = (float)r / (float)0x7FFFFFFF;
             float raw = (n * 2.0f) - 1.0f;
-            ctx->last_sample += ctx->alpha * (raw - ctx->last_sample);
+            ctx->last_sample += current_alpha * (raw - ctx->last_sample);
             float sample = ctx->last_sample;
             if (ctx->crush_scale > 0.0f) {
                 sample = floorf(sample * ctx->crush_scale) / ctx->crush_scale;
@@ -460,10 +531,9 @@ static float _noise_tick_unsafe(NoiseContext* ctx) {
         ctx->channel_index++;
         if (ctx->channel_index >= ctx->channels) ctx->channel_index = 0;
         
-        return ctx->held_sample * ctx->amplitude * pan_gain;
-    }
-    
-    if (ctx->glitch_active) {
+        out_sample = ctx->held_sample * ctx->amplitude * pan_gain * robot_mod;
+    } else {
+        if (ctx->glitch_active) {
         // Handle Single Glitch Sweep Automation
         ctx->glitch_samples_done++;
         float t = (float)ctx->glitch_samples_done / (float)ctx->glitch_samples_total;
@@ -502,7 +572,7 @@ static float _noise_tick_unsafe(NoiseContext* ctx) {
         float raw = (n * 2.0f) - 1.0f;
 
         // Apply simple one-pole low-pass filter
-        ctx->last_sample += ctx->alpha * (raw - ctx->last_sample);
+        ctx->last_sample += current_alpha * (raw - ctx->last_sample);
 
         float sample = ctx->last_sample;
 
@@ -515,10 +585,31 @@ static float _noise_tick_unsafe(NoiseContext* ctx) {
     // Advance channel index for non-sequencer playback too (to keep state consistent if mixed)
     ctx->channel_index++;
     if (ctx->channel_index >= ctx->channels) ctx->channel_index = 0;
+        out_sample = ctx->held_sample * ctx->amplitude * robot_mod;
+    }
 
-    return ctx->held_sample * ctx->amplitude;
+    // Apply Delay Effect
+    if (ctx->delay_buffer && ctx->delay_time_sec > 0.0f) {
+        unsigned int delay_samples = (unsigned int)(ctx->delay_time_sec * (float)ctx->sample_rate);
+        if (delay_samples > 0) {
+            unsigned int ch_count = (ctx->channels > 0) ? ctx->channels : 1;
+            size_t offset = (size_t)delay_samples * ch_count;
+            
+            // Circular read
+            size_t read_idx = (ctx->delay_write_idx + ctx->delay_buffer_len - offset) % ctx->delay_buffer_len;
+            float delayed = ctx->delay_buffer[read_idx];
+            
+            // Circular write with feedback
+            ctx->delay_buffer[ctx->delay_write_idx] = out_sample + (delayed * ctx->delay_feedback);
+            ctx->delay_write_idx = (ctx->delay_write_idx + 1) % ctx->delay_buffer_len;
+            
+            // Mix
+            out_sample = (out_sample * (1.0f - ctx->delay_mix)) + (delayed * ctx->delay_mix);
+        }
+    }
+
+    return out_sample;
 }
-
 /**
  * Generate a single sample of white noise (thread-safe).
  */
@@ -753,6 +844,23 @@ static int l_noise_set_auto_glitch(lua_State *L) {
     NoiseContext *ctx = (NoiseContext *)luaL_checkudata(L, 1, METATABLE_NAME);
     float freq = (float)luaL_checknumber(L, 2);
     noise_set_auto_glitch(ctx, freq);
+    return 0;
+}
+
+static int l_noise_set_robot(lua_State *L) {
+    NoiseContext *ctx = (NoiseContext *)luaL_checkudata(L, 1, METATABLE_NAME);
+    float freq = (float)luaL_checknumber(L, 2);
+    float depth = (float)luaL_optnumber(L, 3, 1.0);
+    noise_set_robot(ctx, freq, depth);
+    return 0;
+}
+
+static int l_noise_set_delay(lua_State *L) {
+    NoiseContext *ctx = (NoiseContext *)luaL_checkudata(L, 1, METATABLE_NAME);
+    float time = (float)luaL_checknumber(L, 2);
+    float feedback = (float)luaL_optnumber(L, 3, 0.3);
+    float mix = (float)luaL_optnumber(L, 4, 0.4);
+    noise_set_delay(ctx, time, feedback, mix);
     return 0;
 }
 
@@ -1052,6 +1160,7 @@ static int l_noise_stop(lua_State *L) {
 static int l_noise_gc(lua_State *L) {
     NoiseContext *ctx = (NoiseContext *)luaL_checkudata(L, 1, METATABLE_NAME);
     pthread_mutex_destroy(&ctx->lock);
+    if (ctx->delay_buffer) free(ctx->delay_buffer);
     if (ctx->seq_steps) free(ctx->seq_steps);
     return 0;
 }
@@ -1064,6 +1173,8 @@ static const struct luaL_Reg noise_methods[] = {
     {"set_decimation", l_noise_set_decimation},
     {"set_tempo", l_noise_set_tempo},
     {"glitch", l_noise_glitch},
+    {"set_delay", l_noise_set_delay},
+    {"set_robot", l_noise_set_robot},
     {"set_auto_glitch", l_noise_set_auto_glitch},
     {"super_stutter", l_noise_super_stutter},
     {"sequence", l_noise_sequence},

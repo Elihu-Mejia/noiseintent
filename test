@@ -1,0 +1,4 @@
+return {
+  {vol=0.353553, tempo=1.000000, seq="<> ;<<!", corpus="", robot_f=5.000000, robot_d=0.120000, delay_t=0.500000, delay_f=0.670000, delay_m=0.320000},
+  {vol=0.353553, tempo=1.000000, seq="<> ;<<!", corpus="", robot_f=5.000000, robot_d=0.120000, delay_t=0.500000, delay_f=0.670000, delay_m=0.320000},
+}
